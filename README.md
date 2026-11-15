@@ -1,5 +1,11 @@
 # free-model-aggregator-01
 
+[![make.fun · free-model-aggregator-01](https://make.fun/badge/free-model-aggregator-01.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![rank](https://make.fun/badge/free-model-aggregator-01/ruri08219/free-model-aggregator-01/rank.svg)](https://make.fun/bounty/free-model-aggregator-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![reward](https://make.fun/badge/free-model-aggregator-01/ruri08219/free-model-aggregator-01/reward.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+
+Built for make.fun's [The best free AI model aggregator](https://make.fun/bounty/free-model-aggregator-01) bounty ($500 in USDC).
+
 The best free AI model aggregator — a zero-config server that serves the
 OpenAI Chat Completions API and the Anthropic Messages API over ten
 simulated free-tier providers, in JSON and in server-sent events.
