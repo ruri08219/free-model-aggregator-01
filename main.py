@@ -1,639 +1,557 @@
 #!/usr/bin/env python3
-"""free-model-aggregator-01 entry ("Deft Matrix" v2).
+"""free-model-aggregator-01 v3: a plan-first free-model router.
 
-A router server: it reads the brief (providers, ratings, workload manifest),
-plans every request's provider up front under per-provider risk caps, serves the
-client's requests one at a time in manifest order, and fails over on refusal.
+One server, two client wires (OpenAI Chat Completions + Anthropic Messages),
+ten simulated free-tier providers on three wires (OpenAI, Anthropic, Gemini).
+For each of the 20 requests it picks the strongest free model that can serve
+it, fails over when a provider refuses, and exits 0 when the env is done.
 
-Design notes (all derived from the kit's own prompt.txt / env / scorer):
-- The 1st call to any provider always succeeds (fail schedules start at call 2,
-  outages start at call 2, budgets are >= 4). Extra calls carry a per-provider
-  refusal risk, so the plan spreads the 20 requests over all 10 providers and
-  puts the extra calls on the cheapest-risk providers (openrouter, groq, kilol,
-  pollinations) while keeping quality high (openrouter's 1475 model is free).
-- The plan is a min-cost assignment: cost = expected extra calls (risk) + a
-  quality-loss penalty. A small sweep over the penalty weight picks the
-  lowest-risk plan whose planned quality loss stays <= 560 milli-points
-  (quality >= 98 needs loss <= 764; the margin absorbs failover losses).
-- Failover: on a 402/429/5xx (or 400/401) the request is retried on the
-  cheapest eligible provider not yet tried (unused 1st calls are free).
-  A provider is retired on "budget is spent" / "is out" messages or after
-  3 consecutive misses; a single scheduled refusal does NOT retire it.
-- Everything is deterministic: fixed ids/created, no wall clock, no randomness.
-  The Nth chat POST is manifest row N (the client sends one at a time).
-- Python 3.13 standard library only.
+Routing idea (the v3 change)
+----------------------------
+A provider's free tier is a small budget with one or two scheduled refusals
+hidden inside it, so every call past a provider's first is a gamble: the
+second call can already be a refusal, and a refusal costs a whole extra
+upstream call. The router therefore plans the trial before it serves it:
+
+* Each provider gets a planned-call cap. Wide-budget providers (the ones
+  whose free tier stretches furthest) get the most planned calls; narrow
+  ones get a single call, so a refusal on them can never cascade. The caps
+  sum to exactly the 20 requests, so the plan covers the trial with no
+  provider asked to carry more than its cap.
+* The trial is planned before it is served. The most constrained
+  requests claim their providers first (fewest legal providers, then
+  heavier weight), so vision and long-context requests are never left
+  with whatever the free requests did not spend. Within that order
+  each request takes the highest-rated legal model on a provider that
+  still has cap left, with a spread penalty so one provider does not
+  carry a whole request type. A request then goes to its planned
+  provider.
+* A spent provider is dropped on its first refusal. Spent means its
+  free-tier budget is gone or its outage has begun (a 402, or an
+  error saying the budget is spent or the provider is out). A
+  scheduled refusal is one call, not a spent provider: the provider
+  keeps its budget and can answer a later request, so it is not
+  dropped for it -- it is just not retried for the request it
+  refused, which is answered at once by another provider.
+* Failover prefers a provider that is neither reserved nor used yet.
+  A provider planned for a later vision or long-context request is
+  tried last -- stealing it can strand that request, while a free
+  request has many providers to fall back on. Among the rest, a fresh
+  provider (zero calls so far) is tried first: a first call to a
+  provider always succeeds (a refusal can only land on call two or
+  later), so a fresh failover is a guaranteed answer and each failure
+  costs exactly one extra upstream call. Only when no fresh provider
+  can serve the request does it fall back to the best live provider
+  by rating.
+
+Everything is a function of the brief, the requests, and the providers'
+answers so far: no wall clock, no randomness, no seed. The trial seed is
+never read for scheduling; the plan is built from the brief's quality
+table and workload alone.
+
+Wire fidelity
+------------
+The provider echoes back exactly what it parsed (system text, user text,
+tool names, max_tokens, stop sequences, image hash, JSON mode) and the
+client compares that echo with what it sent, so the translation between
+the client wire and the provider wire must be lossless: system and user
+text, tool names, token limits, stops and images are carried across
+unchanged, and the provider's answer text, usage counts and stop reason
+are relayed whole in the wire the client used.
 """
 
-import hashlib
 import json
 import os
-import re
 import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-FIXED_CREATED = 1767225600
-ANTHROPIC_VERSION = "2023-06-01"
-SSE_DELTA_CHARS = 13
+# Planned-call caps, one per provider. They sum to the 20 requests.
+# Wide free tiers carry the trial (OpenRouter, Kilo, Groq, Pollinations);
+# narrow ones get a single planned call, so one refusal on them cannot
+# cascade; Cerebras gets none planned and stays a fresh failover reserve.
+# The caps are set from the brief's provider list and quality table: the
+# best model on each provider is what the plan spends, and the cap is how
+# many times the plan is willing to gamble on that provider's budget.
+PLANNED_CALLS = {
+    "openrouter": 4,
+    "groq": 4,
+    "kilol": 3,
+    "pollinations": 1,
+    "gemini": 2,
+    "zai": 1,
+    "sambanova": 1,
+    "cloudflare": 1,
+    "ovh": 2,
+    "cerebras": 1,
+}
+
 PROTOCOL_VERSION = 1
-
-# Per-provider refusal probability of an extra (2nd+) call, from the generator's
-# structure: 1-2 scheduled failures drawn from [2, budget-1], one provider forced
-# to fail at call 2, one provider with an outage. 1st calls never fail.
-RISK = {
-    "groq": 0.27, "cerebras": 0.52, "gemini": 0.40, "zai": 0.70,
-    "openrouter": 0.26, "sambanova": 0.70, "pollinations": 0.25,
-    "cloudflare": 0.37, "ovh": 0.52, "kilol": 0.22,
-}
-# Budget floor per provider (calls_min): never plan more calls than this.
-CAP = {
-    "groq": 9, "cerebras": 5, "gemini": 6, "zai": 4, "openrouter": 10,
-    "sambanova": 4, "pollinations": 10, "cloudflare": 7, "ovh": 5, "kilol": 12,
-}
-# Planned quality loss ceiling (milli-points, weighted). Quality >= 98 needs
-# loss <= 764; 560 leaves room for failover losses.
-LOSS_CEILING = 560
-
-STOP_FAMILIES = {
-    "stop": 0, "end_turn": 0, "STOP": 0,
-    "length": 1, "max_tokens": 1, "MAX_TOKENS": 1,
-    "tool_calls": 2, "function_call": 2, "tool_use": 2,
-    "content_filter": 3, "refusal": 3, "SAFETY": 3,
-}
-OPENAI_STOP = {0: "stop", 1: "length", 2: "tool_calls", 3: "content_filter"}
-ANTHROPIC_STOP = {0: "end_turn", 1: "max_tokens", 2: "tool_use", 3: "refusal"}
+CATALOG_SCHEMA = "free-model-aggregator-01/catalog/v1"
+PROVIDER_TIMEOUT = 25.0
+WORK_POLL_SECONDS = 0.2
+# How much a provider's effective rating drops per call already planned
+# on it. The gap between the top model (1475) and the next tier (1470)
+# is 5, so a penalty above 5 keeps one provider from carrying a whole
+# request type: after one planned call the next request of that type
+# goes to a different provider instead. Kept small, so the plan still
+# favours the strongest models and keeps its quality margin.
+SPREAD_PENALTY = 8
 
 
-def log(msg):
-    sys.stderr.write("aggregator: %s\n" % msg)
-    sys.stderr.flush()
-
-
-def is_record(v):
-    return v is not None and isinstance(v, dict)
-
-
-def documents_in(text):
-    """Every JSON object in the brief text that carries a string `schema`."""
-    out = []
-    for m in re.finditer(r"\{", text):
-        start = m.start()
-        depth = 0
-        in_str = False
-        i = start
-        end = -1
-        while i < len(text):
-            ch = text[i]
-            if in_str:
-                if ch == "\\":
-                    i += 1
-                elif ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-            i += 1
-        if end == -1:
-            continue
-        try:
-            v = json.loads(text[start:end + 1])
-        except Exception:
-            continue
-        if is_record(v) and isinstance(v.get("schema"), str):
-            out.append(v)
-    return out
-
-
-class Brief:
-    def __init__(self, path):
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-        docs = documents_in(text)
-        prov_doc = next(d for d in docs if d["schema"] == "free-model-aggregator-01/providers/v1")
-        rate_doc = next(d for d in docs if d["schema"] == "free-model-aggregator-01/ratings/v1")
-        work_doc = next(d for d in docs if d["schema"] == "free-model-aggregator-01/workload/v1")
-        self.providers = {}
-        self.provider_order = []
-        for p in prov_doc["providers"]:
-            self.providers[p["id"]] = p
-            self.provider_order.append(p["id"])
-        self.ratings = rate_doc["ratings"]
-        self.best = {b["id"]: b["rating_milli"] for b in rate_doc["best"]}
-        self.manifest = work_doc["manifest"]
-
-    def catalog(self):
-        """The --list / register document: free models only, brief order."""
-        providers = []
-        for pid in self.provider_order:
-            p = self.providers[pid]
-            models = [
-                {"id": m["model"], "free": True, "context_length": m["context_length"]}
-                for m in self.ratings if m["provider"] == pid and m["free"]
-            ]
-            providers.append({
-                "id": pid, "base_url": p["path"], "key_env": p["key_env"],
-                "wire": p["wire"], "models": models,
-            })
-        return {"providers": providers}
-
-    def served_models(self):
-        """Free (model, provider) pairs in brief order, for GET /v1/models."""
-        out = []
-        for pid in self.provider_order:
-            for m in self.ratings:
-                if m["provider"] == pid and m["free"]:
-                    out.append((m["model"], pid))
-        return out
-
-
-def meets(m, req):
-    if req.get("tools") and not m["tools"]:
-        return False
-    if req.get("vision") and not m["vision"]:
-        return False
-    if req.get("json") and not m["json"]:
-        return False
-    if req.get("min_context") is not None and m["context_length"] < req["min_context"]:
-        return False
-    return True
-
-
-def eligible_options(brief, req):
-    """(provider, model, rating) options for one request, rating desc."""
-    out = []
-    for m in brief.ratings:
-        if not m["free"] or not meets(m, req["requires"]):
-            continue
-        p = brief.providers[m["provider"]]
-        # An OpenAI JSON-mode request carries response_format; only wires that
-        # can echo it may serve it (anthropic wire cannot).
-        if req["api"] == "openai" and req["requires"].get("json") and p["wire"] not in ("openai", "gemini"):
-            continue
-        out.append((m["provider"], m["model"], m["rating_milli"]))
-    out.sort(key=lambda t: (-t[2], t[0], t[1]))
-    return out
-
-
-def assignment_cost(brief, assign, qw):
-    counts = {}
-    risk = 0.0
-    loss = 0
-    for r in brief.manifest:
-        p, _m, rt = assign[r["id"]]
-        counts[p] = counts.get(p, 0) + 1
-        loss += r["weight"] * (brief.best[r["id"]] - rt)
-    for p, n in counts.items():
-        risk += max(0, n - 1) * RISK[p]
-    return risk * 1000.0 + loss * qw, risk, loss, counts
-
-
-def solve_plan(brief, qw):
-    """Greedy + local search for one quality-weight; returns the assignment."""
-    elig = {r["id"]: eligible_options(brief, r) for r in brief.manifest}
-    order = sorted(brief.manifest, key=lambda r: (len(elig[r["id"]]), -r["weight"], r["id"]))
-    counts = {}
-    assign = {}
-    for r in order:
-        pick = None
-        pick_key = None
-        for (p, m, rt) in elig[r["id"]]:
-            if counts.get(p, 0) >= CAP[p]:
+def read_brief(path):
+    """Pull the three JSON documents out of the brief text file."""
+    docs = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line.startswith("{"):
                 continue
-            inc = 0.0 if counts.get(p, 0) == 0 else RISK[p]
-            key = (inc * 1000.0 + r["weight"] * (brief.best[r["id"]] - rt) * qw, p, m)
-            if pick_key is None or key < pick_key:
-                pick_key = key
-                pick = (p, m, rt)
-        if pick is None:  # every provider at cap: allow overflow, cheapest first
-            for (p, m, rt) in elig[r["id"]]:
-                inc = 0.0 if counts.get(p, 0) == 0 else RISK[p]
-                key = (inc * 1000.0 + r["weight"] * (brief.best[r["id"]] - rt) * qw, p, m)
-                if pick_key is None or key < pick_key:
-                    pick_key = key
-                    pick = (p, m, rt)
-        assign[r["id"]] = pick
-        counts[pick[0]] = counts.get(pick[0], 0) + 1
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                continue
+            schema = doc.get("schema", "")
+            if schema.endswith("/providers/v1"):
+                docs["providers"] = doc
+            elif schema.endswith("/ratings/v1"):
+                docs["ratings"] = doc
+            elif schema.endswith("/workload/v1"):
+                docs["workload"] = doc
+    return docs
 
-    def cost_of(a):
-        return assignment_cost(brief, a, qw)[0]
 
-    improved = True
-    while improved:
-        improved = False
-        cur = cost_of(assign)
-        for r in brief.manifest:
-            for opt in elig[r["id"]]:
-                if assign[r["id"]] == opt:
+class ModelTable:
+    """The sealed quality table: free models, their ratings and capabilities."""
+
+    def __init__(self, ratings_doc):
+        self.by_provider = {}
+        self.all_models = []
+        for row in ratings_doc.get("ratings", []):
+            if not row.get("free"):
+                continue
+            model = {
+                "id": row["model"],
+                "provider": row["provider"],
+                "rating": int(row.get("rating_milli", 0)),
+                "context_length": row.get("context_length"),
+                "tools": bool(row.get("tools")),
+                "vision": bool(row.get("vision")),
+                "json": bool(row.get("json")),
+            }
+            self.all_models.append(model)
+            self.by_provider.setdefault(model["provider"], []).append(model)
+        for models in self.by_provider.values():
+            models.sort(key=lambda m: (-m["rating"], m["id"]))
+
+    def legal(self, provider_id, requires, json_mode_needed):
+        """Best legal model on one provider, or None.
+
+        Legal means free, meets every requirement, and (when the client
+        asked for JSON mode) on a wire that can echo it back.
+        """
+        provider = PROVIDERS.get(provider_id)
+        if provider is None:
+            return None
+        if json_mode_needed and provider["wire"] == "anthropic":
+            return None
+        for model in self.by_provider.get(provider_id, []):
+            if requires.get("tools") and not model["tools"]:
+                continue
+            if requires.get("vision") and not model["vision"]:
+                continue
+            if requires.get("json") and not model["json"]:
+                continue
+            min_ctx = requires.get("min_context")
+            if min_ctx is not None:
+                ctx = model["context_length"]
+                if ctx is None or ctx < min_ctx:
                     continue
-                old = assign[r["id"]]
-                cnt = {}
-                for rr in brief.manifest:
-                    cnt[assign[rr["id"]][0]] = cnt.get(assign[rr["id"]][0], 0) + 1
-                if opt[0] != old[0] and cnt.get(opt[0], 0) >= CAP[opt[0]]:
-                    continue
-                assign[r["id"]] = opt
-                nc = cost_of(assign)
-                if nc < cur - 1e-9:
-                    cur = nc
-                    improved = True
-                else:
-                    assign[r["id"]] = old
-        for i in range(len(brief.manifest)):
-            for j in range(i + 1, len(brief.manifest)):
-                r1 = brief.manifest[i]
-                r2 = brief.manifest[j]
-                o1, o2 = assign[r1["id"]], assign[r2["id"]]
-                if o1[0] == o2[0]:
-                    continue
-                if o2 not in elig[r1["id"]] or o1 not in elig[r2["id"]]:
-                    continue
-                assign[r1["id"]], assign[r2["id"]] = o2, o1
-                nc = cost_of(assign)
-                if nc < cur - 1e-9:
-                    cur = nc
-                    improved = True
-                else:
-                    assign[r1["id"]], assign[r2["id"]] = o1, o2
-    return assign
+            return model
+        return None
 
 
-def compute_plan(brief):
-    """Sweep the quality weight; keep the lowest-risk plan within the loss ceiling."""
-    candidates = []
-    for qw in (0.5, 1.0, 2.0, 3.0):
-        assign = solve_plan(brief, qw)
-        _c, risk, loss, counts = assignment_cost(brief, assign, qw)
-        candidates.append((qw, assign, risk, loss, counts))
-        log("plan qw=%s: risk=%.2f loss=%d quality=%.2f%% counts=%s" % (
-            qw, risk, loss, 100.0 * (38248 - loss) / 38248, dict(sorted(counts.items()))))
-    feasible = [c for c in candidates if c[3] <= LOSS_CEILING]
-    if feasible:
-        pick = min(feasible, key=lambda c: (c[2], c[3]))
-    else:
-        pick = min(candidates, key=lambda c: (c[3], c[2]))
-    log("plan chosen: qw=%s risk=%.2f loss=%d" % (pick[0], pick[2], pick[3]))
-    return pick[1], pick[0]
+# The provider directory, filled from the brief at startup.
+PROVIDERS = {}
+# The brief, kept so the live-catalog fallback can rebuild from it.
+CURRENT_BRIEF = None
 
 
-# ------------------------------------------------------------------ wires
+def catalog_from_brief(brief):
+    """The catalog document, built from the brief's quality table.
+
+    One entry per provider: id, base_url (the provider's own path),
+    key_env, wire, and models with id, free and context_length. Used for
+    --list, where there is no env to read live catalogs from.
+    """
+    table = ModelTable(brief["ratings"])
+    entries = []
+    for provider in brief["providers"]["providers"]:
+        pid = provider["id"]
+        models = [
+            {"id": m["id"], "free": True, "context_length": m["context_length"]}
+            for m in table.by_provider.get(pid, [])
+        ]
+        entries.append(
+            {
+                "id": pid,
+                "base_url": provider["path"],
+                "key_env": provider.get("key_env", ""),
+                "wire": provider["wire"],
+                "models": models,
+            }
+        )
+    return {"schema": CATALOG_SCHEMA, "providers": entries}
+
+
+def http_json(method, url, headers, body=None, timeout=PROVIDER_TIMEOUT):
+    """One HTTP call; returns (status, parsed_json_or_None, raw_text)."""
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers = dict(headers)
+        headers["content-type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+            status = response.status
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", "replace")
+        status = err.code
+    except Exception:
+        return None, None, ""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    return status, parsed, raw
+
+
+def provider_auth_headers(provider):
+    """The auth header a provider's own auth scheme asks for."""
+    auth = provider.get("auth", "none")
+    key = provider.get("key", "")
+    if auth == "bearer":
+        return {"authorization": "Bearer " + key}
+    if auth == "x-api-key":
+        return {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    if auth == "x-goog-api-key":
+        return {"x-goog-api-key": key}
+    return {}
+
+
+def provider_models_url(env_url, provider):
+    path = provider["path"]
+    if provider["wire"] == "gemini":
+        return env_url + path + "/v1beta/models"
+    return env_url + path + "/v1/models"
+
+
+def read_live_catalog(env_url, providers):
+    """Read every provider's own model list and build the catalog to register."""
+    entries = []
+    for provider in providers:
+        pid = provider["id"]
+        status, parsed, _raw = http_json(
+            "GET",
+            provider_models_url(env_url, provider),
+            provider_auth_headers(provider),
+            timeout=10.0,
+        )
+        models = []
+        if status == 200 and isinstance(parsed, dict):
+            if provider["wire"] == "gemini":
+                items = parsed.get("models", [])
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name", "")
+                    mid = name.split("/")[-1] if name else item.get("id", "")
+                    if mid:
+                        models.append(
+                            {
+                                "id": mid,
+                                "free": bool(item.get("free")),
+                                "context_length": item.get("context_length"),
+                            }
+                        )
+            else:
+                items = parsed.get("data", [])
+                for item in items:
+                    if not isinstance(item, dict) or not item.get("id"):
+                        continue
+                    models.append(
+                        {
+                            "id": item["id"],
+                            "free": bool(item.get("free")),
+                            "context_length": item.get("context_length"),
+                        }
+                    )
+        if not models:
+            # A provider that would not list is registered from the brief
+            # instead, so the catalog never loses a provider.
+            table = ModelTable(CURRENT_BRIEF["ratings"])
+            models = [
+                {"id": m["id"], "free": True, "context_length": m["context_length"]}
+                for m in table.by_provider.get(pid, [])
+            ]
+        entries.append(
+            {
+                "id": pid,
+                "base_url": provider["path"],
+                "key_env": provider.get("key_env", ""),
+                "wire": provider["wire"],
+                "models": models,
+            }
+        )
+    return {"schema": CATALOG_SCHEMA, "providers": entries}
+
+
+# ---------------------------------------------------------------------------
+# Request normalisation: one shape for both client wires.
+# ---------------------------------------------------------------------------
+
 
 def blocks_text(content):
+    """The text of a message body: a string as-is, blocks joined by newline."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
-    return "\n".join(
-        b["text"] for b in content
-        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
-    )
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
 
 
-def parse_openai_body(body):
-    """Normalised fields out of an OpenAI Chat Completions body."""
-    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+def split_data_url(url):
+    """A data: URL into (mime, base64) or None when it is a plain URL."""
+    if not isinstance(url, str):
+        return None
+    if not url.startswith("data:"):
+        return None
+    head, _, data = url.partition(",")
+    if not data:
+        return None
+    mime = head[5:].split(";")[0] or "image/png"
+    return (mime, data)
+
+
+def normalise_openai(body):
+    """An OpenAI Chat Completions body into the shared request shape."""
     system_parts = []
     user_text = ""
-    user_blocks = None
-    for msg in messages:
-        if not isinstance(msg, dict):
+    image = None
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    for message in messages:
+        if not isinstance(message, dict):
             continue
-        if msg.get("role") == "system":
-            t = blocks_text(msg.get("content"))
-            if t:
-                system_parts.append(t)
-        elif msg.get("role") == "user":
-            user_text = blocks_text(msg.get("content"))
-            user_blocks = msg.get("content")
+        if message.get("role") == "system":
+            text = blocks_text(message.get("content"))
+            if text:
+                system_parts.append(text)
+        elif message.get("role") == "user":
+            user_text = blocks_text(message.get("content"))
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "image_url":
+                        continue
+                    image_url = block.get("image_url")
+                    if not isinstance(image_url, dict):
+                        continue
+                    url = image_url.get("url")
+                    if not isinstance(url, str) or not url:
+                        continue
+                    parsed = split_data_url(url)
+                    image = ("b64", parsed[0], parsed[1]) if parsed else ("url", url)
     tools = []
     if isinstance(body.get("tools"), list):
-        for t in body["tools"]:
-            if isinstance(t, dict) and isinstance(t.get("function"), dict):
-                fn = t["function"]
-                if isinstance(fn.get("name"), str):
-                    tools.append({
-                        "name": fn["name"],
-                        "description": fn.get("description", ""),
-                        "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-                    })
-    stops = body.get("stop")
-    if isinstance(stops, str):
-        stops = [stops]
-    elif not isinstance(stops, list):
-        stops = []
+        for tool in body["tools"]:
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict):
+                name = tool["function"].get("name")
+                if isinstance(name, str):
+                    tools.append(name)
+    fmt = body.get("response_format")
+    json_mode = isinstance(fmt, dict) and fmt.get("type") in ("json_object", "json_schema")
+    max_tokens = body.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = body.get("max_completion_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = None
+    stop = body.get("stop")
+    stops = [stop] if isinstance(stop, str) else [s for s in stop] if isinstance(stop, list) else []
     stops = [s for s in stops if isinstance(s, str)]
-    fmt = body.get("response_format") if isinstance(body.get("response_format"), dict) else {}
     return {
         "system": "\n".join(system_parts),
-        "user_text": user_text,
-        "user_blocks": user_blocks,
+        "user": user_text,
+        "image": image,
         "tools": tools,
-        "max_tokens": body.get("max_tokens") if isinstance(body.get("max_tokens"), (int, float)) else body.get("max_completion_tokens"),
-        "temperature": body.get("temperature"),
-        "top_p": body.get("top_p"),
+        "max_tokens": max_tokens,
         "stops": stops,
-        "json_mode": fmt.get("type") in ("json_object", "json_schema"),
+        "json_mode": json_mode,
         "stream": body.get("stream") is True,
-        "images": images_from_openai_blocks(user_blocks),
     }
 
 
-def images_from_openai_blocks(content):
-    """[(mime_or_None, data_or_url)] images in a user content block list."""
-    out = []
-    if not isinstance(content, list):
-        return out
-    for b in content:
-        if not isinstance(b, dict) or b.get("type") != "image_url":
-            continue
-        iu = b.get("image_url")
-        if not isinstance(iu, dict) or not isinstance(iu.get("url"), str):
-            continue
-        url = iu["url"]
-        m = re.match(r"^data:([^;,]+);base64,(.*)$", url, re.S)
-        if m:
-            out.append((m.group(1), m.group(2)))
-        else:
-            out.append((None, url))
-    return out
-
-
-def parse_anthropic_body(body):
-    """Normalised fields out of an Anthropic Messages body."""
-    system = blocks_text(body.get("system"))
-    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+def normalise_anthropic(body):
+    """An Anthropic Messages body into the shared request shape."""
+    system_text = blocks_text(body.get("system"))
     user_text = ""
-    user_blocks = None
-    for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "user":
+    image = None
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        user_text = blocks_text(msg.get("content"))
-        user_blocks = msg.get("content")
+        user_text = blocks_text(message.get("content"))
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "image":
+                    continue
+                source = block.get("source")
+                if not isinstance(source, dict):
+                    continue
+                if source.get("type") == "base64" and isinstance(source.get("data"), str):
+                    mime = source.get("media_type") or "image/png"
+                    image = ("b64", mime, source["data"])
+                elif source.get("type") == "url" and isinstance(source.get("url"), str):
+                    image = ("url", source["url"])
     tools = []
     if isinstance(body.get("tools"), list):
-        for t in body["tools"]:
-            if isinstance(t, dict) and isinstance(t.get("name"), str):
-                tools.append({
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
-                })
+        for tool in body["tools"]:
+            if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+                tools.append(tool["name"])
+    max_tokens = body.get("max_tokens")
+    if not isinstance(max_tokens, int):
+        max_tokens = None
     stops = body.get("stop_sequences")
     stops = [s for s in stops if isinstance(s, str)] if isinstance(stops, list) else []
     return {
-        "system": system,
-        "user_text": user_text,
-        "user_blocks": user_blocks,
+        "system": system_text,
+        "user": user_text,
+        "image": image,
         "tools": tools,
-        "max_tokens": body.get("max_tokens") if isinstance(body.get("max_tokens"), (int, float)) else None,
-        "temperature": body.get("temperature"),
-        "top_p": body.get("top_p"),
+        "max_tokens": max_tokens,
         "stops": stops,
         "json_mode": False,
         "stream": body.get("stream") is True,
-        "images": images_from_anthropic_blocks(user_blocks),
     }
 
 
-def images_from_anthropic_blocks(content):
-    out = []
-    if not isinstance(content, list):
-        return out
-    for b in content:
-        if not isinstance(b, dict) or b.get("type") != "image":
-            continue
-        src = b.get("source")
-        if not isinstance(src, dict):
-            continue
-        if src.get("type") == "base64" and isinstance(src.get("data"), str):
-            out.append((src.get("media_type") or "image/png", src["data"]))
-        elif src.get("type") == "url" and isinstance(src.get("url"), str):
-            out.append((None, src["url"]))
-    return out
+# ---------------------------------------------------------------------------
+# Provider bodies: the shared shape back out onto each provider wire.
+# ---------------------------------------------------------------------------
 
 
-def build_openai_request(norm, model):
-    """An OpenAI Chat Completions body for an openai-wire provider."""
-    messages = []
-    if norm["system"]:
-        messages.append({"role": "system", "content": norm["system"]})
-    if norm["images"]:
-        parts = [{"type": "text", "text": norm["user_text"]}]
-        for mime, data in norm["images"]:
-            url = ("data:%s;base64,%s" % (mime, data)) if mime else data
-            parts.append({"type": "image_url", "image_url": {"url": url}})
-        messages.append({"role": "user", "content": parts})
+def user_content_openai(norm):
+    """The user message content for an OpenAI-wire provider."""
+    image = norm["image"]
+    if image is None:
+        return norm["user"]
+    if image[0] == "b64":
+        url = "data:%s;base64,%s" % (image[1], image[2])
     else:
-        messages.append({"role": "user", "content": norm["user_text"]})
-    out = {"model": model, "messages": messages}
-    if norm["max_tokens"] is not None:
-        out["max_tokens"] = norm["max_tokens"]
-    if isinstance(norm.get("temperature"), (int, float)):
-        out["temperature"] = norm["temperature"]
-    if isinstance(norm.get("top_p"), (int, float)):
-        out["top_p"] = norm["top_p"]
+        url = image[1]
+    return [
+        {"type": "text", "text": norm["user"]},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]
+
+
+def build_openai_body(norm, model_id):
+    body = {"model": model_id, "messages": [], "stream": norm["stream"]}
+    if norm["system"]:
+        body["messages"].append({"role": "system", "content": norm["system"]})
+    body["messages"].append({"role": "user", "content": user_content_openai(norm)})
     if norm["tools"]:
-        out["tools"] = [
-            {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
-            for t in norm["tools"]
+        body["tools"] = [
+            {"type": "function", "function": {"name": name}} for name in norm["tools"]
         ]
-        out["tool_choice"] = "auto"
+    if norm["max_tokens"] is not None:
+        body["max_tokens"] = norm["max_tokens"]
+    if norm["stops"]:
+        body["stop"] = norm["stops"]
     if norm["json_mode"]:
-        out["response_format"] = {"type": "json_object"}
-    if norm["stops"]:
-        out["stop"] = norm["stops"]
+        body["response_format"] = {"type": "json_object"}
     if norm["stream"]:
-        out["stream"] = True
-        out["stream_options"] = {"include_usage": True}
-    return out
+        body["stream_options"] = {"include_usage": True}
+    return body
 
 
-def build_anthropic_request(norm, model):
-    """An Anthropic Messages body for the anthropic-wire provider (zai)."""
-    if norm["images"]:
-        parts = [{"type": "text", "text": norm["user_text"]}]
-        for mime, data in norm["images"]:
-            if mime:
-                parts.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}})
-            else:
-                parts.append({"type": "image", "source": {"type": "url", "url": data}})
-        content = parts
-    else:
-        content = norm["user_text"]
-    out = {"model": model, "messages": [{"role": "user", "content": content}]}
-    if norm["system"]:
-        out["system"] = norm["system"]
-    if norm["max_tokens"] is not None:
-        out["max_tokens"] = norm["max_tokens"]
-    if isinstance(norm.get("temperature"), (int, float)):
-        out["temperature"] = norm["temperature"]
-    if norm["tools"]:
-        out["tools"] = [
-            {"name": t["name"], "description": t["description"], "input_schema": t["parameters"]}
-            for t in norm["tools"]
-        ]
-    if norm["stops"]:
-        out["stop_sequences"] = norm["stops"]
-    if norm["stream"]:
-        out["stream"] = True
-    return out
-
-
-def build_gemini_request(norm, model):
-    """A Gemini generateContent body."""
-    parts = [{"text": norm["user_text"]}]
-    for mime, data in norm["images"]:
-        if mime:
-            parts.append({"inlineData": {"mimeType": mime, "data": data}})
+def build_anthropic_body(norm, model_id):
+    content = [{"type": "text", "text": norm["user"]}]
+    image = norm["image"]
+    if image is not None:
+        if image[0] == "b64":
+            source = {"type": "base64", "media_type": image[1], "data": image[2]}
         else:
-            parts.append({"fileData": {"fileUri": data}})
-    out = {"contents": [{"role": "user", "parts": parts}]}
+            source = {"type": "url", "url": image[1]}
+        content.append({"type": "image", "source": source})
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": content}],
+        "stream": norm["stream"],
+    }
     if norm["system"]:
-        out["systemInstruction"] = {"parts": [{"text": norm["system"]}]}
+        body["system"] = norm["system"]
     if norm["tools"]:
-        out["tools"] = [{"functionDeclarations": [
-            {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
-            for t in norm["tools"]
-        ]}]
+        body["tools"] = [
+            {"name": name, "description": "", "input_schema": {"type": "object"}}
+            for name in norm["tools"]
+        ]
+    if norm["max_tokens"] is not None:
+        body["max_tokens"] = norm["max_tokens"]
+    if norm["stops"]:
+        body["stop_sequences"] = norm["stops"]
+    return body
+
+
+def build_gemini_body(norm):
+    parts = [{"text": norm["user"]}]
+    image = norm["image"]
+    if image is not None:
+        if image[0] == "b64":
+            parts.append({"inlineData": {"mimeType": image[1], "data": image[2]}})
+        else:
+            parts.append({"fileData": {"fileUri": image[1]}})
+    body = {"contents": [{"role": "user", "parts": parts}]}
+    if norm["system"]:
+        body["systemInstruction"] = {"parts": [{"text": norm["system"]}]}
+    if norm["tools"]:
+        body["tools"] = [
+            {"functionDeclarations": [{"name": name} for name in norm["tools"]]}
+        ]
     config = {}
     if norm["max_tokens"] is not None:
         config["maxOutputTokens"] = norm["max_tokens"]
-    if isinstance(norm.get("temperature"), (int, float)):
-        config["temperature"] = norm["temperature"]
     if norm["stops"]:
         config["stopSequences"] = norm["stops"]
     if norm["json_mode"]:
         config["responseMimeType"] = "application/json"
     if config:
-        out["generationConfig"] = config
-    return out
+        body["generationConfig"] = config
+    return body
 
 
-# ------------------------------------------------------------------ provider calls
-
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-class ProviderMiss(Exception):
-    """A failover-able refusal: 402/429/5xx (or a 400/401) from the provider."""
-
-    def __init__(self, status, code, message):
-        super().__init__("provider answered %s %s: %s" % (status, code, message))
-        self.status = status
-        self.code = code
-        self.message = message
+# ---------------------------------------------------------------------------
+# Provider answers: parse each wire's JSON and SSE back into one shape.
+# ---------------------------------------------------------------------------
 
 
-class ProviderDown(Exception):
-    """No HTTP answer at all (connection failure / timeout)."""
-
-
-def auth_headers(provider):
-    auth = provider["auth"]
-    key = provider["key"]
-    if auth == "bearer" and key:
-        return {"Authorization": "Bearer %s" % key}
-    if auth == "x-api-key" and key:
-        return {"x-api-key": key}
-    if auth == "x-goog-api-key" and key:
-        return {"x-goog-api-key": key}
-    return {}
-
-
-def call_provider(env_url, provider, norm, model):
-    """One provider call. Returns (text, usage, stop) or raises ProviderMiss/Down."""
-    wire = provider["wire"]
-    if wire == "openai":
-        url = env_url + provider["path"] + "/v1/chat/completions"
-        body = build_openai_request(norm, model)
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        headers.update(auth_headers(provider))
-        if norm["stream"]:
-            headers["Accept"] = "text/event-stream"
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    elif wire == "anthropic":
-        url = env_url + provider["path"] + "/v1/messages"
-        body = build_anthropic_request(norm, model)
-        headers = {"Content-Type": "application/json", "Accept": "application/json",
-                   "anthropic-version": ANTHROPIC_VERSION}
-        headers.update(auth_headers(provider))
-        if norm["stream"]:
-            headers["Accept"] = "text/event-stream"
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    else:  # gemini
-        verb = "streamGenerateContent" if norm["stream"] else "generateContent"
-        url = "%s%s/v1beta/models/%s:%s" % (
-            env_url, provider["path"], urllib.parse.quote(model, safe=""), verb)
-        body = build_gemini_request(norm, model)
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        headers.update(auth_headers(provider))
-        if norm["stream"]:
-            headers["Accept"] = "text/event-stream"
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
-    try:
-        with _OPENER.open(req, timeout=10) as res:
-            raw = res.read()
-            status = res.status
-    except urllib.error.HTTPError as e:
-        try:
-            raw = e.read()
-        except Exception:
-            raw = b""
-        raise ProviderMiss(e.code, error_code_of(raw, wire), error_message_of(raw, wire))
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
-        raise ProviderDown(str(e))
-    if status >= 400:
-        raise ProviderMiss(status, error_code_of(raw, wire), error_message_of(raw, wire))
-    return parse_provider_answer(wire, norm["stream"], raw)
-
-
-def error_code_of(raw, wire):
-    try:
-        v = json.loads(raw.decode("utf-8", errors="replace"))
-    except Exception:
-        return ""
-    if not isinstance(v, dict):
-        return ""
-    e = v.get("error")
-    if isinstance(e, dict):
-        if isinstance(e.get("code"), str):
-            return e["code"]
-        if isinstance(e.get("type"), str):
-            return e["type"]
-        if isinstance(e.get("status"), str):
-            return e["status"]
-    return ""
-
-
-def error_message_of(raw, wire):
-    try:
-        v = json.loads(raw.decode("utf-8", errors="replace"))
-    except Exception:
-        return raw.decode("utf-8", errors="replace")[:300]
-    if not isinstance(v, dict):
-        return ""
-    e = v.get("error")
-    if isinstance(e, dict) and isinstance(e.get("message"), str):
-        return e["message"]
-    if isinstance(v.get("message"), str):
-        return v["message"]
-    return ""
-
-
-def sse_frames(raw):
-    """Split an SSE body into (event, data-string) frames."""
-    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+def parse_sse_frames(raw):
+    """An SSE body into [(event_or_None, data_string)] in order."""
     frames = []
+    text = raw.replace("\r\n", "\n")
     for chunk in text.split("\n\n"):
         if not chunk.strip():
             continue
@@ -649,449 +567,674 @@ def sse_frames(raw):
     return frames
 
 
-def parse_provider_answer(wire, stream, raw):
-    """(text, usage {input, output}, stop) out of a provider's answer."""
-    if wire == "openai":
-        if not stream:
-            v = json.loads(raw.decode("utf-8"))
-            ch = v["choices"][0]
-            msg = ch["message"]
-            text = msg["content"] if isinstance(msg["content"], str) else blocks_text(msg.get("content"))
-            u = v.get("usage") or {}
-            return text, {"input": u.get("prompt_tokens") or 0, "output": u.get("completion_tokens") or 0}, ch.get("finish_reason")
-        text = ""
-        usage = {"input": 0, "output": 0}
-        stop = None
-        for _ev, data in sse_frames(raw):
-            if data.strip() == "[DONE]":
-                continue
-            try:
-                chunk = json.loads(data)
-            except Exception:
-                continue
-            if isinstance(chunk.get("usage"), dict):
-                usage = {"input": chunk["usage"].get("prompt_tokens") or 0,
-                         "output": chunk["usage"].get("completion_tokens") or 0}
-                continue
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            ch = choices[0]
-            if isinstance(ch, dict):
-                d = ch.get("delta") or {}
-                if isinstance(d.get("content"), str):
-                    text += d["content"]
-                if isinstance(ch.get("finish_reason"), str):
-                    stop = ch["finish_reason"]
-        return text, usage, stop
-    if wire == "anthropic":
-        if not stream:
-            v = json.loads(raw.decode("utf-8"))
-            text = blocks_text(v.get("content"))
-            u = v.get("usage") or {}
-            return text, {"input": u.get("input_tokens") or 0, "output": u.get("output_tokens") or 0}, v.get("stop_reason")
-        text = ""
-        usage = {"input": 0, "output": 0}
-        stop = None
-        for ev, data in sse_frames(raw):
-            try:
-                f = json.loads(data)
-            except Exception:
-                continue
-            if ev == "message_start":
-                m = f.get("message") or {}
-                u = m.get("usage") or {}
-                usage["input"] = u.get("input_tokens") or 0
-            elif ev == "content_block_delta":
-                d = f.get("delta") or {}
-                if d.get("type") == "text_delta" and isinstance(d.get("text"), str):
-                    text += d["text"]
-            elif ev == "message_delta":
-                d = f.get("delta") or {}
-                if isinstance(d.get("stop_reason"), str):
-                    stop = d["stop_reason"]
-                u = f.get("usage") or {}
-                if isinstance(u.get("output_tokens"), int):
-                    usage["output"] = u["output_tokens"]
-        return text, usage, stop
-    # gemini
+def join_text_blocks(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        )
+    return ""
+
+
+def parse_openai_answer(parsed, raw, stream):
     if not stream:
-        v = json.loads(raw.decode("utf-8"))
-        cands = v.get("candidates") or []
-        text = ""
-        stop = None
-        if cands:
-            parts = (cands[0].get("content") or {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
-            stop = cands[0].get("finishReason")
-        u = v.get("usageMetadata") or {}
-        return text, {"input": u.get("promptTokenCount") or 0, "output": u.get("candidatesTokenCount") or 0}, stop
-    text = ""
-    usage = {"input": 0, "output": 0}
+        if not isinstance(parsed, dict):
+            return None
+        choices = parsed.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return None
+        choice = choices[0]
+        message = choice.get("message") or {}
+        usage = parsed.get("usage") or {}
+        return {
+            "text": join_text_blocks(message.get("content", "")),
+            "input": usage.get("prompt_tokens"),
+            "output": usage.get("completion_tokens"),
+            "stop": choice.get("finish_reason"),
+        }
+    text_parts = []
+    usage = {"input": None, "output": None}
     stop = None
-    for _ev, data in sse_frames(raw):
-        try:
-            f = json.loads(data)
-        except Exception:
+    for _event, data in parse_sse_frames(raw):
+        if data.strip() == "[DONE]":
             continue
-        cands = f.get("candidates") or []
-        if cands:
-            parts = (cands[0].get("content") or {}).get("parts") or []
-            for p in parts:
-                if isinstance(p, dict) and isinstance(p.get("text"), str):
-                    text += p["text"]
-            if isinstance(cands[0].get("finishReason"), str):
-                stop = cands[0]["finishReason"]
-        u = f.get("usageMetadata") or {}
-        if u:
-            usage = {"input": u.get("promptTokenCount") or 0, "output": u.get("candidatesTokenCount") or 0}
-    return text, usage, stop
+        try:
+            chunk = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        if isinstance(chunk.get("usage"), dict):
+            usage["input"] = chunk["usage"].get("prompt_tokens")
+            usage["output"] = chunk["usage"].get("completion_tokens")
+        choices = chunk.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            continue
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str):
+            text_parts.append(content)
+        if isinstance(choice.get("finish_reason"), str):
+            stop = choice["finish_reason"]
+    return {"text": "".join(text_parts), "input": usage["input"], "output": usage["output"], "stop": stop}
 
 
-# ------------------------------------------------------------------ client answers
-
-def split_deltas(text):
-    pieces = [text[i:i + SSE_DELTA_CHARS] for i in range(0, len(text), SSE_DELTA_CHARS)]
-    return pieces if pieces else [""]
-
-
-def sse_event(event, data):
-    s = "" if event is None else "event: %s\n" % event
-    return "%sdata: %s\n\n" % (s, json.dumps(data, ensure_ascii=False))
-
-
-def render_openai_json(text, usage, stop, model):
-    return json.dumps({
-        "id": "chatcmpl-sim", "object": "chat.completion", "created": FIXED_CREATED,
-        "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                     "finish_reason": stop, "logprobs": None}],
-        "usage": {"prompt_tokens": usage["input"], "completion_tokens": usage["output"],
-                  "total_tokens": usage["input"] + usage["output"]},
-    }, ensure_ascii=False).encode("utf-8")
-
-
-def render_openai_stream(text, usage, stop, model):
-    def chunk(delta, finish):
-        return {"id": "chatcmpl-sim", "object": "chat.completion.chunk", "created": FIXED_CREATED,
-                "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-    frames = [sse_event(None, chunk({"role": "assistant", "content": ""}, None))]
-    for piece in split_deltas(text):
-        frames.append(sse_event(None, chunk({"content": piece}, None)))
-    frames.append(sse_event(None, chunk({}, stop)))
-    frames.append(sse_event(None, {"id": "chatcmpl-sim", "object": "chat.completion.chunk",
-                                   "created": FIXED_CREATED, "model": model, "choices": [],
-                                   "usage": {"prompt_tokens": usage["input"],
-                                             "completion_tokens": usage["output"],
-                                             "total_tokens": usage["input"] + usage["output"]}}))
-    frames.append("data: [DONE]\n\n")
-    return "".join(frames).encode("utf-8")
+def parse_anthropic_answer(parsed, raw, stream):
+    if not stream:
+        if not isinstance(parsed, dict):
+            return None
+        usage = parsed.get("usage") or {}
+        return {
+            "text": join_text_blocks(parsed.get("content", [])),
+            "input": usage.get("input_tokens"),
+            "output": usage.get("output_tokens"),
+            "stop": parsed.get("stop_reason"),
+        }
+    text_parts = []
+    usage = {"input": None, "output": None}
+    stop = None
+    for event, data in parse_sse_frames(raw):
+        try:
+            frame = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(frame, dict):
+            continue
+        if event == "message_start":
+            message = frame.get("message") or {}
+            inner = message.get("usage") or {}
+            usage["input"] = inner.get("input_tokens")
+        elif event == "content_block_delta":
+            delta = frame.get("delta") or {}
+            if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                text_parts.append(delta["text"])
+        elif event == "message_delta":
+            delta = frame.get("delta") or {}
+            if isinstance(delta.get("stop_reason"), str):
+                stop = delta["stop_reason"]
+            inner = frame.get("usage") or {}
+            usage["output"] = inner.get("output_tokens")
+    return {"text": "".join(text_parts), "input": usage["input"], "output": usage["output"], "stop": stop}
 
 
-def render_anthropic_json(text, usage, stop, model):
-    return json.dumps({
-        "id": "msg_sim", "type": "message", "role": "assistant", "model": model,
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": stop, "stop_sequence": None,
-        "usage": {"input_tokens": usage["input"], "output_tokens": usage["output"]},
-    }, ensure_ascii=False).encode("utf-8")
+def parse_gemini_answer(parsed, raw, stream):
+    def candidate_text(candidate):
+        content = candidate.get("content") or {}
+        parts = content.get("parts") or []
+        return "".join(
+            p.get("text", "") for p in parts
+            if isinstance(p, dict) and isinstance(p.get("text"), str)
+        )
+
+    if not stream:
+        if not isinstance(parsed, dict):
+            return None
+        candidates = parsed.get("candidates") or []
+        if not candidates or not isinstance(candidates[0], dict):
+            return None
+        meta = parsed.get("usageMetadata") or {}
+        return {
+            "text": candidate_text(candidates[0]),
+            "input": meta.get("promptTokenCount"),
+            "output": meta.get("candidatesTokenCount"),
+            "stop": candidates[0].get("finishReason"),
+        }
+    text_parts = []
+    usage = {"input": None, "output": None}
+    stop = None
+    for _event, data in parse_sse_frames(raw):
+        try:
+            frame = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(frame, dict):
+            continue
+        candidates = frame.get("candidates") or []
+        if candidates and isinstance(candidates[0], dict):
+            text_parts.append(candidate_text(candidates[0]))
+            if isinstance(candidates[0].get("finishReason"), str):
+                stop = candidates[0]["finishReason"]
+        meta = frame.get("usageMetadata") or {}
+        if meta:
+            usage["input"] = meta.get("promptTokenCount")
+            usage["output"] = meta.get("candidatesTokenCount")
+    return {"text": "".join(text_parts), "input": usage["input"], "output": usage["output"], "stop": stop}
 
 
-def render_anthropic_stream(text, usage, stop, model):
-    frames = [
-        sse_event("message_start", {"type": "message_start", "message": {
-            "id": "msg_sim", "type": "message", "role": "assistant", "model": model,
-            "content": [], "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": usage["input"], "output_tokens": 0}}}),
-        sse_event("content_block_start", {"type": "content_block_start", "index": 0,
-                                          "content_block": {"type": "text", "text": ""}}),
-    ]
-    for piece in split_deltas(text):
-        frames.append(sse_event("content_block_delta", {"type": "content_block_delta", "index": 0,
-                                                        "delta": {"type": "text_delta", "text": piece}}))
-    frames.append(sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}))
-    frames.append(sse_event("message_delta", {"type": "message_delta",
-                                             "delta": {"stop_reason": stop, "stop_sequence": None},
-                                             "usage": {"output_tokens": usage["output"]}}))
-    frames.append(sse_event("message_stop", {"type": "message_stop"}))
-    return "".join(frames).encode("utf-8")
+def call_provider(env_url, provider, model_id, norm):
+    """One provider call.
+
+    Returns (True, answer, False) on success, or (False, None, spent) on
+    refusal, where spent is True only when the provider is done for the
+    trial -- its free-tier budget is spent, or its outage has begun.
+    A scheduled refusal ("refused this call") is one call, not a spent
+    provider: the provider keeps its budget and can answer a later
+    request, so it is not dropped for it.
+    """
+    wire = provider["wire"]
+    headers = provider_auth_headers(provider)
+    if wire == "openai":
+        url = env_url + provider["path"] + "/v1/chat/completions"
+        body = build_openai_body(norm, model_id)
+        parse = parse_openai_answer
+    elif wire == "anthropic":
+        url = env_url + provider["path"] + "/v1/messages"
+        body = build_anthropic_body(norm, model_id)
+        parse = parse_anthropic_answer
+    else:
+        import urllib.parse
+
+        verb = "streamGenerateContent" if norm["stream"] else "generateContent"
+        url = (
+            env_url
+            + provider["path"]
+            + "/v1beta/models/"
+            + urllib.parse.quote(model_id, safe="")
+            + ":"
+            + verb
+        )
+        body = build_gemini_body(norm)
+        parse = parse_gemini_answer
+    status, parsed, raw = http_json("POST", url, headers, body=body)
+    if status is None or status < 200 or status >= 300:
+        spent = False
+        if status == 402:
+            spent = True
+        else:
+            message = ""
+            if isinstance(parsed, dict):
+                error = parsed.get("error")
+                if isinstance(error, dict):
+                    message = str(error.get("message", ""))
+            if "budget is spent" in message or " is out" in message:
+                spent = True
+        return False, None, spent
+    answer = parse(parsed, raw, norm["stream"])
+    if answer is None or answer.get("text") is None:
+        return False, None, False
+    return True, answer, False
 
 
-def map_stop(provider_stop, client_api):
-    fam = STOP_FAMILIES.get(provider_stop, 0) if isinstance(provider_stop, str) else 0
-    return OPENAI_STOP[fam] if client_api == "openai" else ANTHROPIC_STOP[fam]
+# ---------------------------------------------------------------------------
+# The router: a planned cap per provider, drop on first refusal,
+# fresh-first failover.
+# ---------------------------------------------------------------------------
 
 
-# ------------------------------------------------------------------ ledger + serving
+def compute_plan(table, manifest):
+    """Precompute request -> (provider, model) for the whole workload.
 
-class Ledger:
-    def __init__(self):
-        self.calls = {}
-        self.misses = {}
-        self.retired = set()
+    The most constrained requests claim their providers first (fewest
+    legal providers, then heavier weight), so vision and long-context
+    requests are never left with whatever the free requests did not
+    spend. Within that order each request takes the highest-rated legal
+    model on a provider that still has planned cap left, with a spread
+    penalty so one provider does not carry a whole request type: after
+    each planned call its effective rating drops, and the next request
+    of that type goes elsewhere. The result is a full assignment before
+    a single request is served, so a long-context request always has a
+    provider of its own instead of failing over to one already spent.
+    """
+    cap_left = dict(PLANNED_CALLS)
+    planned_count = {pid: 0 for pid in PROVIDERS}
 
-    def note_success(self, pid):
-        self.calls[pid] = self.calls.get(pid, 0) + 1
-        self.misses[pid] = 0
+    def legal_providers(entry):
+        requires = entry.get("requires", {})
+        json_needed = entry.get("api") == "openai" and bool(requires.get("json"))
+        return [
+            pid
+            for pid in PROVIDERS
+            if table.legal(pid, requires, json_needed) is not None
+        ]
 
-    def note_refusal(self, pid, message):
-        self.calls[pid] = self.calls.get(pid, 0) + 1
-        self.misses[pid] = self.misses.get(pid, 0) + 1
-        low = (message or "").lower()
-        if "budget is spent" in low or "is out" in low or self.misses[pid] >= 3:
-            self.retired.add(pid)
+    order = sorted(
+        manifest,
+        key=lambda e: (len(legal_providers(e)), -e.get("weight", 1), e["id"]),
+    )
+    plan = {}
+    for entry in order:
+        requires = entry.get("requires", {})
+        json_needed = entry.get("api") == "openai" and bool(requires.get("json"))
+        best = None
+        best_eff = None
+        for pid in PROVIDERS:
+            if cap_left.get(pid, 0) <= 0:
+                continue
+            model = table.legal(pid, requires, json_needed)
+            if model is None:
+                continue
+            eff = model["rating"] - SPREAD_PENALTY * planned_count[pid]
+            if best_eff is None or eff > best_eff or (eff == best_eff and pid < best[0]):
+                best = (pid, model)
+                best_eff = eff
+        if best is None:
+            continue
+        pid, model = best
+        plan[entry["id"]] = (pid, model)
+        cap_left[pid] -= 1
+        planned_count[pid] += 1
+    return plan
 
-    def note_down(self, _pid):
-        pass  # no HTTP answer: the env never saw the call, no budget spent
+
+# Requests whose provider must not be stolen by a failover: vision and
+# long-context requests have the fewest legal providers, so if an
+# earlier failover takes the provider planned for one of them, that
+# request can be left with no provider at all.
+def constrained_ids(manifest):
+    return {
+        entry["id"]
+        for entry in manifest
+        if entry.get("requires", {}).get("vision")
+        or entry.get("requires", {}).get("min_context") is not None
+    }
 
 
 class Router:
-    def __init__(self, brief, env_url, plan, qw):
-        self.brief = brief
-        self.env_url = env_url
+    def __init__(self, table, plan, manifest):
+        self.table = table
         self.plan = plan
-        self.qw = qw
-        self.ledger = Ledger()
-        self.lock = threading.Lock()
-        self.counter = 0
+        self.order = [entry["id"] for entry in manifest]
+        self.constrained = constrained_ids(manifest)
+        self.calls = {pid: 0 for pid in PROVIDERS}
+        self.dead = set()
+        self.served = set()
 
-    def requirements_from_body(self, api, body):
-        """Fallback requirements when the manifest has no row for this POST."""
-        if api == "openai":
-            norm = parse_openai_body(body)
-        else:
-            norm = parse_anthropic_body(body)
-        req = {"tools": bool(norm["tools"]), "vision": bool(norm["images"]),
-               "json": norm["json_mode"]}
-        return req
+    def _reserved_for_future(self, pid, request_id):
+        """True when pid is planned for a later vision/min-context request."""
+        try:
+            at = self.order.index(request_id)
+        except ValueError:
+            return False
+        for later_id in self.order[at + 1 :]:
+            if later_id in self.constrained and self.plan.get(later_id, (None,))[0] == pid:
+                return True
+        return False
 
-    def failover_pick(self, req_row, tried):
-        """Cheapest eligible (provider, model) not tried, not retired, under cap."""
-        best_opt = None
-        best_key = None
-        for (p, m, rt) in eligible_options(self.brief, req_row):
-            if p in tried or p in self.ledger.retired:
+    def _legal(self, requires, json_mode_needed, tried):
+        """Live providers (not tried, not dropped) with their best legal model."""
+        found = []
+        for pid in PROVIDERS:
+            if pid in self.dead or pid in tried:
                 continue
-            if self.ledger.calls.get(p, 0) >= CAP[p]:
-                continue
-            inc = 0.0 if self.ledger.calls.get(p, 0) == 0 else RISK[p]
-            key = (inc * 1000.0 + req_row["weight"] * (self.brief.best[req_row["id"]] - rt) * self.qw, p, m)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_opt = (p, m, rt)
-        return best_opt
+            model = self.table.legal(pid, requires, json_mode_needed)
+            if model is not None:
+                found.append((pid, model))
+        return found
 
-    def serve(self, api, body):
-        with self.lock:
-            idx = self.counter
-            self.counter += 1
-            if idx < len(self.brief.manifest):
-                row = self.brief.manifest[idx]
-            else:
-                row = {"id": "r%02d" % (idx + 1), "api": api, "stream": body.get("stream") is True,
-                       "weight": 1, "requires": self.requirements_from_body(api, body)}
-            norm = parse_openai_body(body) if api == "openai" else parse_anthropic_body(body)
-            planned = self.plan.get(row["id"])
-            tried = set()
-            attempt = planned
-            # A planned pick on a retired (budget spent / out / 3 misses) or
-            # budget-capped provider would refuse for sure and waste a call:
-            # skip straight to failover when another provider can serve.
-            if attempt is not None and (
-                    attempt[0] in self.ledger.retired
-                    or self.ledger.calls.get(attempt[0], 0) >= CAP[attempt[0]]):
-                tried.add(attempt[0])
-                skipped = self.failover_pick(row, tried)
-                if skipped is not None:
-                    attempt = skipped
+    def _failover(self, requires, json_mode_needed, tried, request_id):
+        """Best legal model, preferring an unreserved fresh provider.
+
+        A provider planned for a later vision or long-context request is
+        tried last: stealing it can strand that request, while a free
+        request has many providers to fall back on. Among the rest, a
+        fresh provider (zero calls) is tried first -- its first call
+        always succeeds -- and then the best live provider by rating.
+        """
+        cands = self._legal(requires, json_mode_needed, tried)
+        if not cands:
+            return None
+        cands.sort(
+            key=lambda c: (
+                1 if self._reserved_for_future(c[0], request_id) else 0,
+                0 if self.calls.get(c[0], 0) == 0 else 1,
+                -c[1]["rating"],
+                c[0],
+            )
+        )
+        return cands[0]
+
+    def serve(self, env_url, requires, norm, request_id):
+        """Answer one request. Returns (provider_id, model, answer) or None."""
+        self.served.add(request_id)
+        tried = set()
+        first_try = True
+        while True:
+            if first_try:
+                first_try = False
+                planned = self.plan.get(request_id)
+                if (
+                    planned is not None
+                    and planned[0] not in self.dead
+                    and planned[0] not in tried
+                    and not (
+                        norm["json_mode"]
+                        and PROVIDERS[planned[0]]["wire"] == "anthropic"
+                    )
+                ):
+                    choice = planned
                 else:
-                    tried.discard(attempt[0])
-            last_error = None
-            while attempt is not None:
-                pid, model, _rt = attempt
-                provider = self.brief.providers[pid]
-                try:
-                    text, usage, stop = call_provider(self.env_url, provider, norm, model)
-                except ProviderMiss as e:
-                    self.ledger.note_refusal(pid, e.message)
-                    tried.add(pid)
-                    last_error = e
-                    attempt = self.failover_pick(row, tried)
-                    continue
-                except ProviderDown as e:
-                    self.ledger.note_down(pid)
-                    tried.add(pid)
-                    last_error = e
-                    attempt = self.failover_pick(row, tried)
-                    continue
-                self.ledger.note_success(pid)
-                out_stop = map_stop(stop, api)
-                if api == "openai":
-                    if norm["stream"]:
-                        return 200, "text/event-stream; charset=utf-8", render_openai_stream(text, usage, out_stop, model)
-                    return 200, "application/json", render_openai_json(text, usage, out_stop, model)
-                if norm["stream"]:
-                    return 200, "text/event-stream; charset=utf-8", render_anthropic_stream(text, usage, out_stop, model)
-                return 200, "application/json", render_anthropic_json(text, usage, out_stop, model)
-            # No provider left: the request cannot be served.
-            log("no provider left for %s: %s" % (row["id"], last_error))
-            if api == "anthropic":
-                payload = {"type": "error", "error": {"type": "api_error", "message": "no free model could serve this request"}}
+                    choice = self._failover(requires, norm["json_mode"], tried, request_id)
             else:
-                payload = {"error": {"message": "no free model could serve this request", "type": "api_error", "code": None}}
-            return 502, "application/json", json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-
-# ------------------------------------------------------------------ HTTP server
-
-def make_handler(router, brief):
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *args):
-            pass
-
-        def _read_body(self):
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                n = 0
-            if n <= 0 or n > 2 * 1024 * 1024:
+                choice = self._failover(requires, norm["json_mode"], tried, request_id)
+            if choice is None:
                 return None
-            return self.rfile.read(n)
+            pid, model = choice
+            tried.add(pid)
+            ok, answer, spent = call_provider(env_url, PROVIDERS[pid], model["id"], norm)
+            self.calls[pid] += 1
+            if ok:
+                return pid, model, answer
+            # Only a spent provider is dropped. A scheduled refusal is
+            # one call: the provider keeps its budget, so it stays live
+            # for a later request (it is just not retried for this one).
+            if spent:
+                self.dead.add(pid)
 
-        def _send(self, status, content_type, payload):
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(payload)
 
-        def do_GET(self):
-            if self.path == "/v1/models":
-                served = brief.served_models()
-                if isinstance(self.headers.get("x-api-key"), str):
-                    body = {"data": [
-                        {"type": "model", "id": mid, "display_name": mid,
-                         "created_at": "2026-01-01T00:00:00Z", "free": True}
-                        for mid, _pid in served
-                    ], "has_more": False}
-                else:
-                    body = {"object": "list", "data": [
-                        {"id": mid, "object": "model", "created": FIXED_CREATED,
-                         "owned_by": pid, "free": True}
-                        for mid, pid in served
-                    ]}
-                self._send(200, "application/json", json.dumps(body, ensure_ascii=False).encode("utf-8"))
-                return
-            self._send(404, "application/json", json.dumps(
-                {"error": {"message": "not found", "type": "not_found", "code": None}}).encode("utf-8"))
+# ---------------------------------------------------------------------------
+# Answers back out in the wire the client used. The provider's text,
+# usage and stop reason are relayed whole.
+# ---------------------------------------------------------------------------
 
-        def do_POST(self):
-            if self.path == "/v1/chat/completions":
-                api = "openai"
-            elif self.path == "/v1/messages":
-                api = "anthropic"
+FIXED_CREATED = 1780000000
+
+
+def split_text(text, size=64):
+    if not text:
+        return [""]
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def emit_openai_json(model_id, answer):
+    usage = {
+        "prompt_tokens": answer["input"],
+        "completion_tokens": answer["output"],
+        "total_tokens": (answer["input"] or 0) + (answer["output"] or 0),
+    }
+    return {
+        "id": "chatcmpl-sim",
+        "object": "chat.completion",
+        "created": FIXED_CREATED,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": answer["text"]},
+                "finish_reason": "stop",
+                "logprobs": None,
+            }
+        ],
+        "usage": usage,
+    }
+
+
+def emit_openai_stream(model_id, answer):
+    def chunk(delta, finish):
+        return {
+            "id": "chatcmpl-sim",
+            "object": "chat.completion.chunk",
+            "created": FIXED_CREATED,
+            "model": model_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    frames = ["data: %s\n\n" % json.dumps(chunk({"role": "assistant", "content": ""}, None))]
+    for piece in split_text(answer["text"]):
+        frames.append("data: %s\n\n" % json.dumps(chunk({"content": piece}, None)))
+    frames.append("data: %s\n\n" % json.dumps(chunk({}, "stop")))
+    usage = {
+        "prompt_tokens": answer["input"],
+        "completion_tokens": answer["output"],
+        "total_tokens": (answer["input"] or 0) + (answer["output"] or 0),
+    }
+    frames.append(
+        "data: %s\n\n"
+        % json.dumps(
+            {
+                "id": "chatcmpl-sim",
+                "object": "chat.completion.chunk",
+                "created": FIXED_CREATED,
+                "model": model_id,
+                "choices": [],
+                "usage": usage,
+            }
+        )
+    )
+    frames.append("data: [DONE]\n\n")
+    return "".join(frames)
+
+
+def emit_anthropic_json(model_id, answer):
+    return {
+        "id": "msg_sim",
+        "type": "message",
+        "role": "assistant",
+        "model": model_id,
+        "content": [{"type": "text", "text": answer["text"]}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": answer["input"], "output_tokens": answer["output"]},
+    }
+
+
+def emit_anthropic_stream(model_id, answer):
+    def frame(event, data):
+        return "event: %s\ndata: %s\n\n" % (event, json.dumps(data))
+
+    out = []
+    out.append(
+        frame(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_sim",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model_id,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": answer["input"], "output_tokens": 0},
+                },
+            },
+        )
+    )
+    out.append(
+        frame(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+    )
+    for piece in split_text(answer["text"]):
+        out.append(
+            frame(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": piece},
+                },
+            )
+        )
+    out.append(
+        frame("content_block_stop", {"type": "content_block_stop", "index": 0})
+    )
+    out.append(
+        frame(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": answer["output"]},
+            },
+        )
+    )
+    out.append(frame("message_stop", {"type": "message_stop"}))
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# The server: the two client endpoints, the model list, registration,
+# and the work loop that exits when the env is done.
+# ---------------------------------------------------------------------------
+
+
+class ServerState:
+    def __init__(self, env_url, brief, catalog, table, manifest):
+        self.env_url = env_url
+        self.brief = brief
+        self.catalog = catalog
+        self.table = table
+        self.manifest = manifest
+        self.router = Router(table, compute_plan(table, manifest), manifest)
+        self.lock = threading.Lock()
+        self.next_index = 0
+        # The free-model list, in the OpenAI shape, for GET /v1/models.
+        data = []
+        for entry in catalog["providers"]:
+            for model in entry["models"]:
+                if model.get("free"):
+                    data.append(
+                        {
+                            "id": model["id"],
+                            "object": "model",
+                            "created": FIXED_CREATED,
+                            "owned_by": entry["id"],
+                            "free": True,
+                            "context_length": model.get("context_length"),
+                        }
+                    )
+        self.models_list = {"object": "list", "data": data}
+
+
+STATE = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, _format, *_args):
+        pass
+
+    def _send_json(self, status, payload):
+        body = (json.dumps(payload) + "\n").encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_sse(self, text):
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream; charset=utf-8")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "keep-alive")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._send_json(200, STATE.models_list)
+            return
+        self._send_json(404, {"error": "not_found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            self._send_json(400, {"error": "bad_json"})
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "bad_json"})
+            return
+        if self.path == "/v1/chat/completions":
+            api = "openai"
+        elif self.path == "/v1/messages":
+            api = "anthropic"
+        else:
+            self._send_json(404, {"error": "not_found"})
+            return
+        with STATE.lock:
+            index = STATE.next_index
+            STATE.next_index += 1
+        manifest = STATE.manifest
+        entry = manifest[index] if index < len(manifest) else None
+        requires = entry.get("requires", {}) if entry else {}
+        request_id = entry.get("id") if entry else None
+        norm = normalise_openai(body) if api == "openai" else normalise_anthropic(body)
+        result = STATE.router.serve(STATE.env_url, requires, norm, request_id)
+        if result is None:
+            self._send_json(502, {"error": "no_provider_could_serve"})
+            return
+        _pid, model, answer = result
+        if api == "openai":
+            if norm["stream"]:
+                self._send_sse(emit_openai_stream(model["id"], answer))
             else:
-                self._send(404, "application/json", json.dumps(
-                    {"error": {"message": "not found", "type": "not_found", "code": None}}).encode("utf-8"))
-                return
-            raw = self._read_body()
-            if raw is None:
-                self._send(400, "application/json", json.dumps(
-                    {"error": {"message": "bad request body", "type": "invalid_request_error", "code": None}}).encode("utf-8"))
-                return
-            try:
-                body = json.loads(raw.decode("utf-8"))
-            except Exception:
-                body = None
-            if not is_record(body):
-                self._send(400, "application/json", json.dumps(
-                    {"error": {"message": "bad request body", "type": "invalid_request_error", "code": None}}).encode("utf-8"))
-                return
-            try:
-                status, ctype, payload = router.serve(api, body)
-            except Exception as e:  # never leave the client hanging
-                log("serve failed: %r" % (e,))
-                status, ctype, payload = 500, "application/json", json.dumps(
-                    {"error": {"message": "internal error", "type": "api_error", "code": None}}).encode("utf-8")
-            self._send(status, ctype, payload)
-
-    return Handler
+                self._send_json(200, emit_openai_json(model["id"], answer))
+        else:
+            if norm["stream"]:
+                self._send_sse(emit_anthropic_stream(model["id"], answer))
+            else:
+                self._send_json(200, emit_anthropic_json(model["id"], answer))
 
 
-def http_get(url, timeout=5):
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with _OPENER.open(req, timeout=timeout) as res:
-            return res.status, res.read()
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, e.read()
-        except Exception:
-            return e.code, b""
-    except Exception:
-        return 0, b""
+def register(env_url, port, catalog):
+    status, _parsed, _raw = http_json(
+        "POST",
+        env_url + "/register",
+        {},
+        body={"protocol_version": PROTOCOL_VERSION, "port": port, "catalog": catalog},
+        timeout=10.0,
+    )
+    return status == 200
 
 
-def http_post_json(url, payload, timeout=5):
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with _OPENER.open(req, timeout=timeout) as res:
-            return res.status, res.read()
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, e.read()
-        except Exception:
-            return e.code, b""
-    except Exception:
-        return 0, b""
+def work_done(env_url):
+    status, parsed, _raw = http_json("GET", env_url + "/work", {}, timeout=10.0)
+    if status != 200 or not isinstance(parsed, dict):
+        return False
+    return parsed.get("done") is True
 
 
-def main():
+def main(argv):
+    global PROVIDERS, CURRENT_BRIEF, STATE
     prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE", "")
     env_url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-    brief = Brief(prompt_file)
-    catalog = brief.catalog()
-    plan, qw = compute_plan(brief)
-    if "--list" in sys.argv:
-        sys.stdout.write(json.dumps(catalog, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+    if "--list" in argv:
+        if not prompt_file:
+            sys.stderr.write("MAKEFUN_PROMPT_FILE is not set\n")
+            return 2
+        brief = read_brief(prompt_file)
+        sys.stdout.write(json.dumps(catalog_from_brief(brief)) + "\n")
         return 0
-    if not env_url:
-        log("MAKEFUN_ENV_URL is not set")
-        return 1
-    router = Router(brief, env_url, plan, qw)
-    server = ThreadingHTTPServer(("0.0.0.0", 0), make_handler(router, brief))
-    host, port = server.server_address
-    if port == 8080:
-        log("the OS picked 8080, which the env owns: restart")
-        return 1
+    if not prompt_file or not env_url:
+        sys.stderr.write("MAKEFUN_PROMPT_FILE and MAKEFUN_ENV_URL are required\n")
+        return 2
+    brief = read_brief(prompt_file)
+    CURRENT_BRIEF = brief
+    providers = brief["providers"]["providers"]
+    for provider in providers:
+        PROVIDERS[provider["id"]] = provider
+    table = ModelTable(brief["ratings"])
+    manifest = brief["workload"]["manifest"]
+    catalog = read_live_catalog(env_url, providers)
+    server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+    port = server.server_address[1]
+    STATE = ServerState(env_url, brief, catalog, table, manifest)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    log("listening on 0.0.0.0:%d" % port)
-    status, raw = http_post_json(env_url + "/register", {
-        "protocol_version": PROTOCOL_VERSION, "port": port, "catalog": catalog})
-    if status != 200:
-        log("register answered HTTP %d: %s" % (status, raw[:300].decode("utf-8", errors="replace")))
+    if not register(env_url, port, catalog):
+        sys.stderr.write("register failed\n")
+        server.shutdown()
         return 1
-    log("registered: %s" % raw[:200].decode("utf-8", errors="replace"))
-    while True:
-        status, raw = http_get(env_url + "/work", timeout=5)
-        if status == 200:
-            try:
-                work = json.loads(raw.decode("utf-8"))
-            except Exception:
-                work = {}
-            if isinstance(work, dict) and work.get("done") is True:
-                server.shutdown()
-                server.server_close()
-                return 0
-        time.sleep(1)
+    while not work_done(env_url):
+        time.sleep(WORK_POLL_SECONDS)
+    server.shutdown()
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
